@@ -332,7 +332,11 @@ impl Rain {
             return None;
         }
         let hue = self.cols.get(x as usize).map_or(0.0, |c| c.hue) + self.elapsed * 0.08;
-        Some((c.ch, theme.color_at(c.glow, c.head, c.highlight, hue)))
+        let depth = f32::from(y) / f32::from(self.h.saturating_sub(1).max(1));
+        Some((
+            c.ch,
+            theme.color_at(c.glow, c.head, c.highlight, hue, depth),
+        ))
     }
 }
 
@@ -819,15 +823,52 @@ mod tests {
                     }
                     heads += 1;
                     let (_, rgb) = r.color_of(x, y, &theme).expect("a head is lit");
+                    let depth = f32::from(y) / 19.0;
                     let want = if highlight > 0.0 {
-                        theme.head
+                        theme.color_at(1.0, true, true, 0.0, depth)
                     } else {
-                        theme.color_at(c.glow, false, false, 0.0)
+                        theme.color_at(c.glow, false, false, 0.0, depth)
                     };
                     assert_eq!(rgb, want, "highlight {highlight}, head at ({x},{y})");
                 }
             }
             assert!(heads > 0, "no heads on screen to check");
         }
+    }
+
+    #[test]
+    fn a_white_head_dims_as_its_drop_falls() {
+        // A highlighted head is the brightest glyph its drop ever draws, so if
+        // it dims with depth, every glyph the drop writes starts dimmer lower
+        // down. See DEFAULT_DEPTH_FADE.
+        let theme = Theme::from_base((0, 255, 65), false);
+        let h = 30u16;
+        let mut r = Rain::new(
+            1,
+            h,
+            Config {
+                highlight: 1.0,
+                density: 1.0,
+                mutate: 0.0,
+                ..cfg(9)
+            },
+        );
+        let mut by_row: Vec<Option<Rgb>> = vec![None; usize::from(h)];
+        for _ in 0..900 {
+            r.step(1.0 / 60.0);
+            for y in 0..h {
+                if r.cell(0, y).expect("in bounds by construction").head {
+                    by_row[usize::from(y)] = r.color_of(0, y, &theme).map(|(_, rgb)| rgb);
+                }
+            }
+        }
+        let seen: Vec<Rgb> = by_row.iter().flatten().copied().collect();
+        assert!(by_row[0].is_some() && by_row[usize::from(h) - 1].is_some());
+        let green = |rgb: &Rgb| rgb.1;
+        assert!(
+            seen.windows(2).all(|w| green(&w[1]) <= green(&w[0])),
+            "a head brightened on its way down: {seen:?}"
+        );
+        assert!(green(&seen[seen.len() - 1]) < green(&seen[0]));
     }
 }

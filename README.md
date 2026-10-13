@@ -41,7 +41,8 @@ string in five has a highlighted white leading glyph, and most strings sit at
 one dim level for their whole length. Here a highlighted drop holds full
 brightness for the first half of its trail and slides to half over the second;
 an ordinary drop runs at half brightness, head included. Every trail dims to
-dark green over its last stretch and is then erased.
+dark green over its last stretch and is then erased, and glyphs start a quarter
+dimmer at the bottom of the screen than at the top.
 
 ## Install
 
@@ -159,7 +160,7 @@ So the tuning knobs are all about emitting fewer bytes:
 
 | Setting | Effect |
 |---|---|
-| `--levels <N\|auto>` | Brightness steps; `auto` sizes them from the window. A cell only repaints when it crosses a step. Most trails hold one level for most of their length, so this matters less than it did: `8` is ~1.8× less output than unquantised. |
+| `--levels <N\|auto>` | Brightness steps; `auto` sizes them from the window. A cell only repaints when it crosses a step. Most trails hold one level for most of their length, so this matters less than it did: `8` is ~1.7× less output than unquantised. |
 | `--fps <N>` | A **weak** lever, despite appearances — see below. |
 | `-d`, `--tail-max` | Fewer/shorter trails means fewer lit cells. |
 
@@ -167,12 +168,12 @@ Measured at 200×50, 600 frames per row:
 
 | `--levels` | bytes/frame | at 30 fps | cells repainted | vs unquantised |
 |---|---|---|---|---|
-| none | 14,490 | 0.43 MB/s | 7.6% | 1.00× |
-| 64 | 14,214 | 0.43 MB/s | 7.4% | 1.02× |
-| 32 | 13,073 | 0.39 MB/s | 6.9% | 1.11× |
-| **24** (`auto` on a small window) | **12,815** | **0.38 MB/s** | **6.6%** | **1.13×** |
-| 16 | 11,266 | 0.34 MB/s | 5.9% | 1.29× |
-| 8 | 7,958 | 0.24 MB/s | 4.5% | 1.82× |
+| none | 13,653 | 0.41 MB/s | 7.2% | 1.00× |
+| 64 | 13,481 | 0.40 MB/s | 7.1% | 1.01× |
+| 32 | 12,567 | 0.38 MB/s | 6.7% | 1.09× |
+| **24** (`auto` on a small window) | **11,884** | **0.36 MB/s** | **6.4%** | **1.15×** |
+| 16 | 10,881 | 0.33 MB/s | 5.8% | 1.25× |
+| 8 | 7,914 | 0.24 MB/s | 4.5% | 1.73× |
 
 ### Recommended settings
 
@@ -189,9 +190,9 @@ Pinning a higher count costs less than the curve assumes.
 
 | Window | `auto` picks | Output |
 |---|---|---|
-| 80×24 | 24 | ~0.08 MB/s |
-| 120×40 | 22 | ~0.19 MB/s |
-| 200×50 | 15 | ~0.34 MB/s |
+| 80×24 | 24 | ~0.07 MB/s |
+| 120×40 | 22 | ~0.18 MB/s |
+| 200×50 | 15 | ~0.33 MB/s |
 | 204×175 | 8 | ~0.9 MB/s |
 
 Pass a number to pin it — `--levels 16` — or `--levels 0` to disable
@@ -214,10 +215,10 @@ case — 204×175 is 35,700 cells, nine times a stock 80×24. Measured there, ov
 
 | Settings | bytes/frame | at 30 fps |
 |---|---|---|
-| `-d 0.75 --tail-max 40` (dense, long) | 48,878 | 1.47 MB/s |
-| `--levels 12` added | 36,403 | 1.09 MB/s |
-| `--levels 8` added | 29,041 | 0.87 MB/s |
-| default density/tail, `--levels 12` | 33,288 | 1.00 MB/s |
+| `-d 0.75 --tail-max 40` (dense, long) | 44,970 | 1.35 MB/s |
+| `--levels 12` added | 35,610 | 1.07 MB/s |
+| `--levels 8` added | 28,899 | 0.87 MB/s |
+| default density/tail, `--levels 12` | 32,556 | 0.98 MB/s |
 
 Density and tail length set how many cells are lit, and dense-and-long roughly
 doubles that. It no longer doubles the output: a lit cell that holds its level
@@ -237,11 +238,11 @@ changed — so the product barely moves. At 204×175:
 
 | `--fps` | bytes/frame | MB/s | if it were linear |
 |---|---|---|---|
-| 60 | 15,874 | 0.95 | — |
-| **30** (default) | 29,424 | **0.88** | 0.88 |
-| 24 | 35,444 | 0.85 | 0.71 |
-| 15 | 52,319 | **0.78** | 0.44 |
-| 10 | 67,497 | 0.67 | 0.29 |
+| 60 | 15,799 | 0.95 | — |
+| **30** (default) | 29,281 | **0.88** | 0.88 |
+| 24 | 35,275 | 0.85 | 0.70 |
+| 15 | 52,102 | **0.78** | 0.44 |
+| 10 | 67,239 | 0.67 | 0.29 |
 
 Dropping 30 → 15 fps buys **11%**, not 50%, and costs you half your frames. Going
 the other way is nearly free: 60 fps costs only 8% more than 30. Spend your
@@ -318,9 +319,9 @@ Kept here because they look obviously correct and aren't:
   most lit cells hold their colour, so it is a larger share than it used to be,
   but still a small one.
 
-Reusing the pen for imperceptible colour deltas *did* pay, but modestly — 6%
-under the old fade. Most trails now hold one colour, so there are few near-misses
-left to reuse it for, and it is down to under 1%.
+Reusing the pen for imperceptible colour deltas *did* pay, but modestly — 6%.
+Most of that now comes from the depth fade, which draws the same brightness
+level in a slightly different shade on every row.
 
 Reproduce any of this with `cargo run --release --example perf`, which breaks
 output down by escape-sequence type and runs the comparisons above. The figures

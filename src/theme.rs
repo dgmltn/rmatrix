@@ -142,7 +142,20 @@ pub struct Theme {
     pub rainbow: bool,
     /// Quantisation steps; 0 disables quantisation entirely.
     pub levels: u16,
+    /// How much dimmer a glyph starts on the bottom row than on the top, as a
+    /// fraction of full brightness. See [`DEFAULT_DEPTH_FADE`].
+    pub depth_fade: f32,
 }
+
+/// Glyphs on the bottom row start at three-quarters of the brightness they
+/// would have on the top row, falling linearly in between.
+///
+/// In the film the rain is brightest near the top and a little subdued lower
+/// down. A glyph never moves once written, so dimming by row is the same thing
+/// as each drop's newest glyph starting dimmer the further it has fallen, and it
+/// needs no state: it is a function of where the cell is. A quarter is enough to
+/// read as depth without the bottom of a tall window looking unlit.
+pub const DEFAULT_DEPTH_FADE: f32 = 0.25;
 
 impl Theme {
     #[must_use]
@@ -153,24 +166,39 @@ impl Theme {
             dim: (0, 0, 0),
             rainbow,
             levels: DEFAULT_LEVELS,
+            depth_fade: DEFAULT_DEPTH_FADE,
         }
     }
 
-    /// The colour of a highlighted drop's cell. `glow` 1.0 is freshly written,
-    /// 0.0 is about to be erased. `hue_shift` rotates the hue in rainbow mode
-    /// and is ignored otherwise.
+    /// The colour of a highlighted drop's cell on the top row. `glow` 1.0 is
+    /// freshly written, 0.0 is about to be erased. `hue_shift` rotates the hue
+    /// in rainbow mode and is ignored otherwise.
     #[must_use]
     pub fn color(&self, glow: f32, is_head: bool, hue_shift: f32) -> Rgb {
-        self.color_at(glow, is_head, true, hue_shift)
+        self.color_at(glow, is_head, true, hue_shift, 0.0)
     }
 
     /// As [`color`](Self::color), for a cell written by a drop that is or isn't
-    /// `highlighted`. Only a highlighted drop's head is drawn white. A
+    /// `highlighted`, `depth` of the way down the screen: 0.0 is the top row
+    /// and 1.0 the bottom. Only a highlighted drop's head is drawn white. A
     /// highlighted trail holds full brightness for its first half and slides
     /// to half over the second; an ordinary one runs at half throughout. Both
     /// dim over their last 15% and never go below a quarter while lit.
     #[must_use]
-    pub fn color_at(&self, glow: f32, is_head: bool, highlighted: bool, hue_shift: f32) -> Rgb {
+    pub fn color_at(
+        &self,
+        glow: f32,
+        is_head: bool,
+        highlighted: bool,
+        hue_shift: f32,
+        depth: f32,
+    ) -> Rgb {
+        let depth = if depth.is_finite() {
+            depth.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let peak = 1.0 - self.depth_fade.clamp(0.0, 1.0) * depth;
         let (bright, dim, head) = if self.rainbow {
             let b = hsv_to_rgb(hue_shift.rem_euclid(1.0), 0.85, 1.0);
             (b, self.dim, head_tint(b))
@@ -179,7 +207,7 @@ impl Theme {
         };
 
         if is_head && highlighted {
-            return head;
+            return lerp(dim, head, peak);
         }
         let t = if glow.is_finite() {
             glow.clamp(0.0, 1.0)
@@ -187,8 +215,9 @@ impl Theme {
             0.0
         };
         // Quantise *after* the profile so the steps are evenly spaced in the
-        // output colour rather than bunched at the dim end.
-        let level = self.quantise(trail_brightness(t, highlighted));
+        // output colour rather than bunched at the dim end, and floor *after*
+        // the depth fade so the bottom rows can't sink under it.
+        let level = self.quantise(trail_brightness(t, highlighted)) * peak;
         let level = if level > 0.0 { level.max(DIMMEST) } else { 0.0 };
         lerp(dim, bright, level)
     }
@@ -234,8 +263,9 @@ const TAIL_FROM: f32 = 0.85;
 /// Judged by eye in Ghostty on a black background: at 0.125 (green 32) the end
 /// of every trail read as a scatter of black shapes that caught the eye, and at
 /// 0.25 (green 64) it reads as the dim end of the trail. It is a fixed level on
-/// purpose. Flooring at a quantisation step instead sank with the step count:
-/// green 21 at the 24 levels `auto` picks for a small window.
+/// purpose. Flooring at a quantisation step instead sank with the step count —
+/// green 21 at the 24 levels `auto` picks for a small window — and the depth
+/// fade took another quarter off the bottom rows.
 const DIMMEST: f32 = 0.25;
 
 /// Brightness in [0,1] for a trail cell, falling to exactly 0 at the glow where
@@ -435,7 +465,7 @@ mod tests {
             // cell itself, which the renderer blanks to the background.
             let mut greens: Vec<i32> = (0..=2000)
                 .map(|i| EPS.powf(i as f32 / 2000.0))
-                .map(|glow| i32::from(t.color_at(glow, false, highlighted, 0.0).1))
+                .map(|glow| i32::from(t.color_at(glow, false, highlighted, 0.0, 0.0).1))
                 .collect();
             greens.push(0);
             greens.dedup();
@@ -461,23 +491,27 @@ mod tests {
     #[test]
     fn a_lit_glyph_is_never_dimmer_than_dark_green() {
         // Glyphs much dimmer than this read as black shapes rather than green,
-        // and every trail ended in them. A floor at a quantisation step sank
-        // as `auto` picked more levels: green 21 at 24 levels.
+        // and every trail ended in them. Two things pushed tails under it: the
+        // floor was a quantisation step, so it sank as `auto` picked more
+        // levels (green 21 at 24 levels), and the depth fade scaled it down a
+        // further quarter on the bottom rows (27 seen at 14 levels).
         let floor = lerp((0, 0, 0), (0, 255, 65), DIMMEST).1;
         for levels in [0u16, 6, 8, 14, 24] {
             for highlighted in [true, false] {
-                let mut t = Theme::from_base((0, 255, 65), false);
-                t.levels = levels;
-                let dimmest = (0..2000)
-                    .map(|i| EPS.powf(i as f32 / 2000.0))
-                    .map(|glow| t.color_at(glow, false, highlighted, 0.0).1)
-                    .filter(|&g| g > 0)
-                    .min();
-                assert_eq!(
-                    dimmest,
-                    Some(floor),
-                    "levels {levels}, highlighted {highlighted}"
-                );
+                for depth in [0.0, 0.5, 1.0] {
+                    let mut t = Theme::from_base((0, 255, 65), false);
+                    t.levels = levels;
+                    let dimmest = (0..2000)
+                        .map(|i| EPS.powf(i as f32 / 2000.0))
+                        .map(|glow| t.color_at(glow, false, highlighted, 0.0, depth).1)
+                        .filter(|&g| g > 0)
+                        .min();
+                    assert_eq!(
+                        dimmest,
+                        Some(floor),
+                        "levels {levels}, highlighted {highlighted}, depth {depth}"
+                    );
+                }
             }
         }
     }
@@ -525,8 +559,8 @@ mod tests {
         let mut t = Theme::from_base((0, 255, 65), false);
         t.levels = 0;
         assert_eq!(
-            t.color_at(1.0, true, false, 0.0),
-            t.color_at(1.0, false, false, 0.0),
+            t.color_at(1.0, true, false, 0.0, 0.0),
+            t.color_at(1.0, false, false, 0.0, 0.0),
             "an ordinary head is the same green as its trail"
         );
     }
@@ -538,6 +572,39 @@ mod tests {
             assert!(profile(0.99, highlighted) < 0.05);
             assert!(close(profile(1.0, highlighted), 0.0));
         }
+    }
+
+    #[test]
+    fn glyphs_start_dimmer_toward_the_bottom_of_the_screen() {
+        let t = Theme::from_base((0, 255, 65), false);
+        for is_head in [false, true] {
+            let at = |depth: f32| luma(t.color_at(1.0, is_head, true, 0.0, depth));
+            let ratio = at(1.0) / at(0.0);
+            assert!(
+                (0.73..=0.77).contains(&ratio),
+                "head {is_head}: the bottom row is {ratio} of the top"
+            );
+            for i in 0..10 {
+                let (upper, lower) = (i as f32 / 10.0, (i + 1) as f32 / 10.0);
+                assert!(
+                    at(lower) <= at(upper),
+                    "head {is_head}: brighter at {lower}"
+                );
+            }
+        }
+        // And with the fade off, every row is drawn alike.
+        let flat = Theme {
+            depth_fade: 0.0,
+            ..t
+        };
+        assert_eq!(
+            flat.color_at(0.5, false, true, 0.0, 0.0),
+            flat.color_at(0.5, false, true, 0.0, 1.0)
+        );
+        assert_eq!(
+            t.color_at(0.5, false, true, 0.0, f32::NAN),
+            t.color(0.5, false, 0.0)
+        );
     }
 
     #[test]
