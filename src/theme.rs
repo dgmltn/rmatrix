@@ -266,6 +266,9 @@ const TAIL_FROM: f32 = 0.85;
 /// purpose. Flooring at a quantisation step instead sank with the step count —
 /// green 21 at the 24 levels `auto` picks for a small window — and the depth
 /// fade took another quarter off the bottom rows.
+///
+/// It also keeps 256-colour mode green: the palette has nothing between black
+/// and green 95 except greys, and anything much dimmer than this lands on one.
 const DIMMEST: f32 = 0.25;
 
 /// Brightness in [0,1] for a trail cell, falling to exactly 0 at the glow where
@@ -367,22 +370,44 @@ impl FromStr for BaseColor {
     }
 }
 
+/// Channel intensities of the xterm 6x6x6 colour cube, palette 16..=231.
+const CUBE: [u8; 6] = [0, 95, 135, 175, 215, 255];
+
+/// The palette entry nearest `(r, g, b)`, from the cube or the grey ramp.
+///
+/// Nearest by squared RGB distance, choosing between the closest cube colour
+/// and the closest grey — the rule tmux uses when it downsamples 24-bit colour,
+/// so a trail looks the same run directly or through tmux.
+///
+/// Scaling each channel by 5/255 looks equivalent and is not: the cube's levels
+/// are not evenly spaced, with a 95-wide gap above black and 40 between the
+/// rest, so linear scaling puts most values in the wrong bin (green 105 went to
+/// 135, not 95). Those misplacements are uneven steps in a fading trail.
 fn rgb_to_256(r: u8, g: u8, b: u8) -> u8 {
-    // Greys have their own ramp and quantise much better there.
-    if r.abs_diff(g) < 8 && g.abs_diff(b) < 8 {
-        let level = (u16::from(r) + u16::from(g) + u16::from(b)) / 3;
-        if level < 8 {
-            return 16;
-        }
-        if level > 248 {
-            return 231;
-        }
-        // The grey ramp is 232..=255 — 24 slots, so the index must top out at
-        // 23. Scaling by 24 here reaches 24 at level 248 and overflows u8.
-        return 232 + ((level - 8) * 23 / 240) as u8;
+    let level = |c: u8| {
+        (0..CUBE.len())
+            .min_by_key(|&i| CUBE[i].abs_diff(c))
+            .unwrap_or(0)
+    };
+    let (ri, gi, bi) = (level(r), level(g), level(b));
+    let cube = (CUBE[ri], CUBE[gi], CUBE[bi]);
+
+    // The grey ramp is 8, 18, .. 238 at 232..=255, and the grey nearest a colour
+    // is the one nearest its channel mean. Worked on the sum to stay exact.
+    let sum = i32::from(r) + i32::from(g) + i32::from(b);
+    let gi_ramp = (sum - 24 + 15).div_euclid(30).clamp(0, 23);
+    let grey = (8 + 10 * gi_ramp) as u8;
+
+    if distance((r, g, b), (grey, grey, grey)) < distance((r, g, b), cube) {
+        232 + gi_ramp as u8
+    } else {
+        (16 + 36 * ri + 6 * gi + bi) as u8
     }
-    let q = |c: u8| u16::from(c) * 5 / 255;
-    (16 + 36 * q(r) + 6 * q(g) + q(b)) as u8
+}
+
+fn distance((r1, g1, b1): Rgb, (r2, g2, b2): Rgb) -> i32 {
+    let d = |a: u8, b: u8| (i32::from(a) - i32::from(b)).pow(2);
+    d(r1, r2) + d(g1, g2) + d(b1, b2)
 }
 
 fn rgb_to_16(r: u8, g: u8, b: u8) -> u8 {
@@ -666,15 +691,48 @@ mod tests {
         }
     }
 
-    #[test]
-    fn greyscale_quantisation_stays_in_the_256_ramp() {
-        for level in 0..=255u8 {
-            let v = rgb_to_256(level, level, level);
-            assert!(
-                v == 16 || v == 231 || (232..=255).contains(&v),
-                "grey {level} -> {v}"
-            );
+    /// What palette entry `i` (16..=255) actually displays.
+    fn palette(i: u8) -> Rgb {
+        if i >= 232 {
+            let v = 8 + 10 * (i - 232);
+            return (v, v, v);
         }
+        let i = usize::from(i - 16);
+        (CUBE[i / 36], CUBE[i / 6 % 6], CUBE[i % 6])
+    }
+
+    #[test]
+    fn a_grey_never_picks_up_a_tint_in_256_colour_mode() {
+        // Greys can land on the cube's own greys (59, 102, ..) as well as the
+        // ramp, whichever is nearer; what must never happen is a tint.
+        for level in 0..=255u8 {
+            let (r, g, b) = palette(rgb_to_256(level, level, level));
+            assert!(r == g && g == b, "grey {level} came out as ({r}, {g}, {b})");
+        }
+    }
+
+    #[test]
+    fn every_colour_maps_to_its_nearest_256_colour_entry() {
+        // The old per-channel `c * 5 / 255` put most values in the wrong cube
+        // bin — green 105 became 135 rather than 95 — and only ever chose the
+        // grey ramp for near-greys. A fade through the 256 palette then took
+        // uneven steps, and a dark green rounded straight to black where a dark
+        // grey was closer. Checked against brute force over the whole palette.
+        let mut checked = 0;
+        for r in (0..=255u8).step_by(15) {
+            for g in (0..=255u8).step_by(5) {
+                for b in (0..=255u8).step_by(15) {
+                    let best = (16..=255u8)
+                        .map(|i| distance((r, g, b), palette(i)))
+                        .min()
+                        .expect("palette is non-empty");
+                    let got = distance((r, g, b), palette(rgb_to_256(r, g, b)));
+                    assert_eq!(got, best, "({r}, {g}, {b}) -> {}", rgb_to_256(r, g, b));
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 10_000);
     }
 
     #[test]
