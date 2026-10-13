@@ -16,8 +16,10 @@ use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
-/// Below this, a cell is considered dark and gets erased.
-const EPS: f32 = 0.012;
+/// Below this, a cell is considered dark and gets erased. `Theme` reads it too:
+/// the colour ramp has to reach black at exactly this glow, or the erase shows
+/// up as a final step of its own.
+pub(crate) const EPS: f32 = 0.012;
 /// Guards the `speed / tail` decay solve against a divide-by-nearly-zero.
 const MIN_TAIL: f32 = 0.5;
 
@@ -27,7 +29,12 @@ pub struct Cell {
     pub glow: f32,
     /// Per-second multiplicative decay, captured from the drop that wrote it.
     pub decay: f32,
+    /// The leading glyph of its drop. Structural: churn leaves it alone and it
+    /// is cleared as the drop moves on, whether or not it is drawn white.
     pub head: bool,
+    /// Written by a highlighted drop, whose head is drawn white. See
+    /// [`Config::highlight`].
+    pub highlight: bool,
 }
 
 impl Default for Cell {
@@ -37,6 +44,7 @@ impl Default for Cell {
             glow: 0.0,
             decay: 0.5,
             head: false,
+            highlight: false,
         }
     }
 }
@@ -48,6 +56,7 @@ struct Drop {
     tail: f32,
     /// Index of the cell currently rendered as the head, so we can un-head it.
     head_idx: Option<usize>,
+    highlight: bool,
 }
 
 #[derive(Debug)]
@@ -67,9 +76,20 @@ pub struct Config {
     pub tail_max: f32,
     pub mutate: f32,
     pub glyphs: Vec<char>,
+    /// Fraction of drops that lead with a white glyph; the rest lead in the
+    /// body colour. See [`DEFAULT_HIGHLIGHT`].
+    pub highlight: f32,
     /// `None` draws a seed from the OS; `Some` replays deterministically.
     pub seed: Option<u64>,
 }
+
+/// One drop in five leads with a white glyph.
+///
+/// From frame-by-frame study of the film's opening sequence
+/// (<https://carlnewton.github.io/digital-rain-analysis/>): roughly 1 in 5
+/// strings has a highlighted leading glyph, and the rest lead in the same green
+/// as their trail. A white head on every drop reads as cmatrix, not the film.
+pub const DEFAULT_HIGHLIGHT: f32 = 0.2;
 
 impl Default for Config {
     fn default() -> Self {
@@ -80,6 +100,7 @@ impl Default for Config {
             tail_max: 26.0,
             mutate: 0.35,
             glyphs: crate::charset::Charset::Classic.glyphs(""),
+            highlight: DEFAULT_HIGHLIGHT,
             seed: None,
         }
     }
@@ -241,6 +262,7 @@ impl Rain {
                             glow: 1.0,
                             decay,
                             head: true,
+                            highlight: d.highlight,
                         };
                         d.head_idx = Some(idx);
                     }
@@ -276,6 +298,7 @@ impl Rain {
                 speed: rng.random_range(6.0..26.0),
                 tail: rng.random_range(cfg.tail_min..hi),
                 head_idx: None,
+                highlight: rng.random::<f32>() < cfg.highlight,
             });
             col.gap = rng.random_range(2.0..14.0);
             col.cooldown = rng.random_range(0.0..0.6);
@@ -309,7 +332,7 @@ impl Rain {
             return None;
         }
         let hue = self.cols.get(x as usize).map_or(0.0, |c| c.hue) + self.elapsed * 0.08;
-        Some((c.ch, theme.color(c.glow, c.head, hue)))
+        Some((c.ch, theme.color_at(c.glow, c.head, c.highlight, hue)))
     }
 }
 
@@ -721,5 +744,90 @@ mod tests {
             long > short * 2,
             "--tail had little effect: short={short} rows, long={long} rows"
         );
+    }
+
+    /// The share of on-screen drops whose head is drawn white. Every drop on
+    /// screen has exactly one head cell, so counting heads counts drops.
+    fn white_head_share(highlight: f32) -> f32 {
+        let (w, h) = (200u16, 50u16);
+        let mut r = Rain::new(
+            w,
+            h,
+            Config {
+                highlight,
+                ..cfg(21)
+            },
+        );
+        let (mut heads, mut white) = (0u32, 0u32);
+        for frame in 0..3000 {
+            r.step(1.0 / 30.0);
+            // Skip the warm-up, then sample every tenth frame.
+            if frame < 300 || frame % 10 != 0 {
+                continue;
+            }
+            for y in 0..h {
+                for x in 0..w {
+                    let c = r.cell(x, y).expect("in bounds by construction");
+                    if c.head {
+                        heads += 1;
+                        white += u32::from(c.highlight);
+                    }
+                }
+            }
+        }
+        assert!(heads > 1000, "only {heads} heads sampled");
+        white as f32 / heads as f32
+    }
+
+    #[test]
+    fn about_one_drop_in_five_leads_with_a_white_glyph() {
+        // The film's ratio; see DEFAULT_HIGHLIGHT. Before this every drop led
+        // white, which is cmatrix's look rather than the film's.
+        let share = white_head_share(DEFAULT_HIGHLIGHT);
+        assert!(
+            (0.15..=0.25).contains(&share),
+            "{share} of heads were white"
+        );
+        assert_eq!(white_head_share(0.0), 0.0);
+        assert_eq!(white_head_share(1.0), 1.0);
+    }
+
+    #[test]
+    fn only_a_highlighted_head_is_drawn_white() {
+        // The rest lead in the body colour at full glow, so the head of an
+        // ordinary drop is simply the brightest green in its trail.
+        let theme = Theme::from_base((0, 255, 65), false);
+        for highlight in [0.0, 1.0] {
+            let mut r = Rain::new(
+                40,
+                20,
+                Config {
+                    highlight,
+                    density: 1.0,
+                    ..cfg(5)
+                },
+            );
+            for _ in 0..60 {
+                r.step(1.0 / 30.0);
+            }
+            let mut heads = 0;
+            for y in 0..20 {
+                for x in 0..40 {
+                    let c = *r.cell(x, y).expect("in bounds by construction");
+                    if !c.head {
+                        continue;
+                    }
+                    heads += 1;
+                    let (_, rgb) = r.color_of(x, y, &theme).expect("a head is lit");
+                    let want = if highlight > 0.0 {
+                        theme.head
+                    } else {
+                        theme.color_at(c.glow, false, false, 0.0)
+                    };
+                    assert_eq!(rgb, want, "highlight {highlight}, head at ({x},{y})");
+                }
+            }
+            assert!(heads > 0, "no heads on screen to check");
+        }
     }
 }

@@ -243,6 +243,7 @@ pub(crate) fn validate(args: &Args) -> Result<Settings> {
             tail_max: args.tail_max,
             mutate: args.mutate,
             glyphs: args.charset.glyphs(&args.custom),
+            highlight: rmatrix::DEFAULT_HIGHLIGHT,
             seed: args.seed,
         },
         frame,

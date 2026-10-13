@@ -5,6 +5,7 @@
 //! `glow` in [0,1] onto a 24-bit ramp, which is what makes the trail read as a
 //! fade rather than as bands.
 
+use crate::rain::EPS;
 use crossterm::style::Color;
 use std::str::FromStr;
 use thiserror::Error;
@@ -135,7 +136,8 @@ pub struct Theme {
     pub head: Rgb,
     /// Full-intensity body colour just behind the head.
     pub bright: Rgb,
-    /// The colour a trail decays toward before it is erased.
+    /// The colour a trail's brightness is measured up from: a cell at zero
+    /// brightness would be this. Black by default.
     pub dim: Rgb,
     pub rainbow: bool,
     /// Quantisation steps; 0 disables quantisation entirely.
@@ -148,47 +150,126 @@ impl Theme {
         Theme {
             head: head_tint(base),
             bright: base,
-            dim: scale(base, 0.18),
+            dim: (0, 0, 0),
             rainbow,
             levels: DEFAULT_LEVELS,
         }
     }
 
-    /// `glow` 1.0 is freshly written, 0.0 is about to be erased. `hue_shift`
-    /// rotates the hue in rainbow mode and is ignored otherwise.
+    /// The colour of a highlighted drop's cell. `glow` 1.0 is freshly written,
+    /// 0.0 is about to be erased. `hue_shift` rotates the hue in rainbow mode
+    /// and is ignored otherwise.
     #[must_use]
     pub fn color(&self, glow: f32, is_head: bool, hue_shift: f32) -> Rgb {
+        self.color_at(glow, is_head, true, hue_shift)
+    }
+
+    /// As [`color`](Self::color), for a cell written by a drop that is or isn't
+    /// `highlighted`. Only a highlighted drop's head is drawn white. A
+    /// highlighted trail holds full brightness for its first half and slides
+    /// to half over the second; an ordinary one runs at half throughout. Both
+    /// dim over their last 15% and never go below a quarter while lit.
+    #[must_use]
+    pub fn color_at(&self, glow: f32, is_head: bool, highlighted: bool, hue_shift: f32) -> Rgb {
         let (bright, dim, head) = if self.rainbow {
             let b = hsv_to_rgb(hue_shift.rem_euclid(1.0), 0.85, 1.0);
-            (b, scale(b, 0.18), head_tint(b))
+            (b, self.dim, head_tint(b))
         } else {
             (self.bright, self.dim, self.head)
         };
 
-        if is_head {
+        if is_head && highlighted {
             return head;
         }
-        // Gamma > 1 keeps the bright zone tight to the head and lets the rest of
-        // the tail linger dim — closer to the film than a linear ramp.
         let t = if glow.is_finite() {
             glow.clamp(0.0, 1.0)
         } else {
             0.0
         };
-        // Quantise *after* the gamma so the steps are evenly spaced in the
+        // Quantise *after* the profile so the steps are evenly spaced in the
         // output colour rather than bunched at the dim end.
-        lerp(dim, bright, self.quantise(t.powf(1.7)))
+        let level = self.quantise(trail_brightness(t, highlighted));
+        let level = if level > 0.0 { level.max(DIMMEST) } else { 0.0 };
+        lerp(dim, bright, level)
     }
 
-    /// Snap to the nearest of `levels` steps. Holding a cell's colour steady
+    /// Snap up to the next of `levels` steps. Holding a cell's colour steady
     /// across frames is what stops it generating damage every single frame.
+    ///
+    /// Up, not to nearest: a lit cell never rounds down to black. Drawing a
+    /// black glyph costs the same bytes as a visible one and shows as a smudge
+    /// on any background that isn't pure black.
     fn quantise(&self, t: f32) -> f32 {
-        if self.levels == 0 {
-            return t;
+        if self.levels == 0 || t <= 0.0 {
+            return t.max(0.0);
         }
         let n = f32::from(self.levels);
-        (t * n).round() / n
+        (t * n).ceil() / n
     }
+}
+
+/// Brightness of an ordinary drop's whole trail, and where a highlighted
+/// drop's trail settles after its bright first half.
+///
+/// Half the colour value, which on a black background is also about half the
+/// perceived lightness (L* 46 against 88 for the default green). In the film
+/// most strings sit at this one level and only the highlighted ones run
+/// brighter.
+const SETTLED: f32 = 0.5;
+
+/// How far along its trail a highlighted drop stays at full brightness.
+const HOLD_UNTIL: f32 = 0.5;
+
+/// Where every trail starts its fade to black.
+///
+/// The film cuts glyphs off; here they fade, because a cut from 50% straight to
+/// black is the jump this profile exists to avoid. 15% is about one row on the
+/// shortest default trail and four on the longest — enough to read as a fade
+/// on most drops without eating into the settled body.
+const TAIL_FROM: f32 = 0.85;
+
+/// The dimmest a lit glyph is ever drawn, as a fraction of the base colour, so
+/// a trail fades to dark green and is then erased.
+///
+/// Judged by eye in Ghostty on a black background: at 0.125 (green 32) the end
+/// of every trail read as a scatter of black shapes that caught the eye, and at
+/// 0.25 (green 64) it reads as the dim end of the trail. It is a fixed level on
+/// purpose. Flooring at a quantisation step instead sank with the step count:
+/// green 21 at the 24 levels `auto` picks for a small window.
+const DIMMEST: f32 = 0.25;
+
+/// Brightness in [0,1] for a trail cell, falling to exactly 0 at the glow where
+/// `Rain` erases it.
+///
+/// Glow decays exponentially, and every drop's decay is solved so that glow
+/// reaches `EPS` exactly `tail` rows behind the head. So `ln(glow) / ln(EPS)`
+/// is the cell's position along its own trail, 0 at the head and 1 at the
+/// erase, whatever the drop's speed and length. The profile is a function of
+/// that position:
+///
+/// | along | highlighted drop | ordinary drop |
+/// |---|---|---|
+/// | 0 to 0.5 | full | half |
+/// | 0.5 to 0.85 | full sliding to half | half |
+/// | 0.85 to 1 | half sliding to black | half sliding to black |
+///
+/// The tail runs all the way to 0 so the descent is even right down to
+/// [`DIMMEST`], where `color_at` holds it until the erase. The ramp this
+/// replaced flattened out at 18% halfway down every trail and sat there, so
+/// the back half of each trail was one colour ending in a cut.
+fn trail_brightness(glow: f32, highlighted: bool) -> f32 {
+    if glow <= EPS {
+        return 0.0;
+    }
+    let along = (glow.ln() / EPS.ln()).clamp(0.0, 1.0);
+    let body = if highlighted {
+        let settling = ((along - HOLD_UNTIL) / (TAIL_FROM - HOLD_UNTIL)).clamp(0.0, 1.0);
+        1.0 - (1.0 - SETTLED) * settling
+    } else {
+        SETTLED
+    };
+    let tail = ((along - TAIL_FROM) / (1.0 - TAIL_FROM)).clamp(0.0, 1.0);
+    body * (1.0 - tail)
 }
 
 fn head_tint(base: Rgb) -> Rgb {
@@ -202,11 +283,6 @@ fn lerp((r1, g1, b1): Rgb, (r2, g2, b2): Rgb, t: f32) -> Rgb {
             .clamp(0.0, 255.0) as u8
     };
     (f(r1, r2), f(g1, g2), f(b1, b2))
-}
-
-fn scale((r, g, b): Rgb, t: f32) -> Rgb {
-    let f = |c: u8| (f32::from(c) * t).round().clamp(0.0, 255.0) as u8;
-    (f(r), f(g), f(b))
 }
 
 #[must_use]
@@ -340,6 +416,127 @@ mod tests {
             let l = luma(t.color(i as f32 / 20.0, false, 0.0));
             assert!(l >= prev, "ramp dipped at glow {}", i as f32 / 20.0);
             prev = l;
+        }
+    }
+
+    #[test]
+    fn a_trail_steps_down_evenly_to_dark_green_then_is_erased() {
+        // The original ramp stalled at 18% for the back half of every trail and
+        // was then cut to black. Now a trail descends in even steps, holds at
+        // DIMMEST, and the erase is the only step bigger than the rest.
+        let floor = i32::from(lerp((0, 0, 0), (0, 255, 65), DIMMEST).1);
+        for (levels, highlighted) in [0u16, 6, 8, 12, 24]
+            .into_iter()
+            .flat_map(|l| [(l, true), (l, false)])
+        {
+            let mut t = Theme::from_base((0, 255, 65), false);
+            t.levels = levels;
+            // Head to erasure exactly as `Rain` decays a cell, then the erased
+            // cell itself, which the renderer blanks to the background.
+            let mut greens: Vec<i32> = (0..=2000)
+                .map(|i| EPS.powf(i as f32 / 2000.0))
+                .map(|glow| i32::from(t.color_at(glow, false, highlighted, 0.0).1))
+                .collect();
+            greens.push(0);
+            greens.dedup();
+            let steps: Vec<i32> = greens.windows(2).map(|w| w[0] - w[1]).collect();
+            let (last, rest) = steps.split_last().expect("the ramp has steps");
+            assert_eq!(
+                *last, floor,
+                "levels {levels}: erased from {last}, not dark green"
+            );
+            // One quantisation step, or a rounding unit when unquantised.
+            let even = if levels == 0 {
+                2
+            } else {
+                255 / i32::from(levels) + 2
+            };
+            assert!(
+                rest.iter().all(|&s| s <= even),
+                "levels {levels}, highlighted {highlighted}: uneven descent {rest:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lit_glyph_is_never_dimmer_than_dark_green() {
+        // Glyphs much dimmer than this read as black shapes rather than green,
+        // and every trail ended in them. A floor at a quantisation step sank
+        // as `auto` picked more levels: green 21 at 24 levels.
+        let floor = lerp((0, 0, 0), (0, 255, 65), DIMMEST).1;
+        for levels in [0u16, 6, 8, 14, 24] {
+            for highlighted in [true, false] {
+                let mut t = Theme::from_base((0, 255, 65), false);
+                t.levels = levels;
+                let dimmest = (0..2000)
+                    .map(|i| EPS.powf(i as f32 / 2000.0))
+                    .map(|glow| t.color_at(glow, false, highlighted, 0.0).1)
+                    .filter(|&g| g > 0)
+                    .min();
+                assert_eq!(
+                    dimmest,
+                    Some(floor),
+                    "levels {levels}, highlighted {highlighted}"
+                );
+            }
+        }
+    }
+
+    /// Brightness `along` of the way down a trail, before quantisation and the
+    /// DIMMEST floor, so the profile itself is what is measured.
+    fn profile(along: f32, highlighted: bool) -> f32 {
+        trail_brightness(EPS.powf(along), highlighted)
+    }
+
+    fn close(a: f32, b: f32) -> bool {
+        (a - b).abs() < 0.01
+    }
+
+    #[test]
+    fn a_highlighted_trail_holds_full_brightness_for_half_its_length_then_settles_at_half() {
+        for along in [0.0, 0.2, 0.45, 0.5] {
+            assert!(
+                close(profile(along, true), 1.0),
+                "{along}: {}",
+                profile(along, true)
+            );
+        }
+        // Sliding, not stepping, between the hold and the settled level.
+        assert!(
+            close(profile(0.675, true), 0.75),
+            "{}",
+            profile(0.675, true)
+        );
+        assert!(close(profile(0.85, true), 0.5), "{}", profile(0.85, true));
+    }
+
+    #[test]
+    fn an_ordinary_trail_sits_at_half_brightness_until_its_tail() {
+        // Four strings in five run their whole length at one dim level in the
+        // film; fading from the head made every drop look like a highlighted
+        // one, only shorter.
+        for along in [0.0, 0.3, 0.6, 0.85] {
+            assert!(
+                close(profile(along, false), 0.5),
+                "{along}: {}",
+                profile(along, false)
+            );
+        }
+        let mut t = Theme::from_base((0, 255, 65), false);
+        t.levels = 0;
+        assert_eq!(
+            t.color_at(1.0, true, false, 0.0),
+            t.color_at(1.0, false, false, 0.0),
+            "an ordinary head is the same green as its trail"
+        );
+    }
+
+    #[test]
+    fn every_trail_fades_to_black_over_its_last_stretch() {
+        for highlighted in [true, false] {
+            assert!(close(profile(0.925, highlighted), 0.25));
+            assert!(profile(0.99, highlighted) < 0.05);
+            assert!(close(profile(1.0, highlighted), 0.0));
         }
     }
 

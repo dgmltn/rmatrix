@@ -26,7 +26,7 @@ rmatrix targets what terminals can actually do now:
 
 | | cmatrix | rmatrix |
 |---|---|---|
-| Trail shading | 3 brightness steps | a 24-bit ramp, 8–24 steps sized to your window (`--levels 0` for a fully continuous fade) |
+| Trail shading | 3 brightness steps | modelled on the film: 1 drop in 5 leads white and fades from full to half brightness, the rest run at half; 24-bit, 8–24 steps sized to your window |
 | Glyphs | ASCII, or katakana via `-c` | halfwidth katakana by default, 8 built-in sets, `--custom` |
 | Motion | fixed tick | rows/second, integrated against real time — same speed at any frame rate |
 | Redraw | full screen | damage-tracked; an unchanged frame emits zero bytes |
@@ -34,6 +34,14 @@ rmatrix targets what terminals can actually do now:
 | Terminal layer | ncurses | crossterm — no system library to install |
 | Colour | 8 ANSI colours | any `#RRGGBB`, with automatic truecolor/256/16 fallback |
 | Reproducibility | — | `--seed` replays an identical animation |
+
+The trail profile follows [a frame-by-frame study of the film's opening
+sequence](https://carlnewton.github.io/digital-rain-analysis/): roughly one
+string in five has a highlighted white leading glyph, and most strings sit at
+one dim level for their whole length. Here a highlighted drop holds full
+brightness for the first half of its trail and slides to half over the second;
+an ordinary drop runs at half brightness, head included. Every trail dims to
+dark green over its last stretch and is then erased.
 
 ## Install
 
@@ -151,7 +159,7 @@ So the tuning knobs are all about emitting fewer bytes:
 
 | Setting | Effect |
 |---|---|
-| `--levels <N\|auto>` | Brightness steps; `auto` sizes them from the window. A cell only repaints when it crosses a step, so this is the biggest lever. `8` is ~2.6× less output than unquantised, and still nearly 3× cmatrix's three levels. |
+| `--levels <N\|auto>` | Brightness steps; `auto` sizes them from the window. A cell only repaints when it crosses a step. Most trails hold one level for most of their length, so this matters less than it did: `8` is ~1.8× less output than unquantised. |
 | `--fps <N>` | A **weak** lever, despite appearances — see below. |
 | `-d`, `--tail-max` | Fewer/shorter trails means fewer lit cells. |
 
@@ -159,12 +167,12 @@ Measured at 200×50, 600 frames per row:
 
 | `--levels` | bytes/frame | at 30 fps | cells repainted | vs unquantised |
 |---|---|---|---|---|
-| none | 36,857 | 1.11 MB/s | 21.9% | 1.00× |
-| 64 | 29,574 | 0.89 MB/s | 16.1% | 1.25× |
-| 32 | 25,005 | 0.75 MB/s | 13.1% | 1.47× |
-| **24** (`auto` on a small window) | **22,220** | **0.67 MB/s** | **11.9%** | **1.66×** |
-| 16 | 20,134 | 0.60 MB/s | 10.1% | 1.83× |
-| 8 | 13,943 | 0.42 MB/s | 7.3% | 2.64× |
+| none | 14,490 | 0.43 MB/s | 7.6% | 1.00× |
+| 64 | 14,214 | 0.43 MB/s | 7.4% | 1.02× |
+| 32 | 13,073 | 0.39 MB/s | 6.9% | 1.11× |
+| **24** (`auto` on a small window) | **12,815** | **0.38 MB/s** | **6.6%** | **1.13×** |
+| 16 | 11,266 | 0.34 MB/s | 5.9% | 1.29× |
+| 8 | 7,958 | 0.24 MB/s | 4.5% | 1.82× |
 
 ### Recommended settings
 
@@ -175,14 +183,16 @@ and it returns.
 
 The curve is `1500 / √cells`, clamped to 6..24. That is fitted, not guessed: it
 passes through the two points reached by measurement — 24 steps at a stock 80×24,
-and 8 at a full-screen vertical 204×175.
+and 8 at a full-screen vertical 204×175. It was fitted against a fade that cost
+about twice what the current trail profile does, so it is now conservative.
+Pinning a higher count costs less than the curve assumes.
 
 | Window | `auto` picks | Output |
 |---|---|---|
-| 80×24 | 24 | ~0.14 MB/s |
-| 120×40 | 22 | ~0.33 MB/s |
-| 200×50 | 15 | ~0.6 MB/s |
-| 204×175 | 8 | ~1.8 MB/s |
+| 80×24 | 24 | ~0.08 MB/s |
+| 120×40 | 22 | ~0.19 MB/s |
+| 200×50 | 15 | ~0.34 MB/s |
+| 204×175 | 8 | ~0.9 MB/s |
 
 Pass a number to pin it — `--levels 16` — or `--levels 0` to disable
 quantisation entirely. Pin it higher if you see the tails step rather than fade;
@@ -191,7 +201,7 @@ step every five rows.
 
 Density and tail length are not auto-scaled, because they are aesthetic choices
 rather than quality/cost trade-offs. On a big screen `--tail-max 40 -d 0.75`
-looks good and costs about twice the defaults.
+looks good and costs about 15% more than the defaults at the same `--levels`.
 
 If it still struggles, reach for density and tail length before `--fps`; see
 [frame rate is a weak lever](#frame-rate-is-a-weak-lever).
@@ -204,13 +214,14 @@ case — 204×175 is 35,700 cells, nine times a stock 80×24. Measured there, ov
 
 | Settings | bytes/frame | at 30 fps |
 |---|---|---|
-| `-d 0.75 --tail-max 40` (dense, long) | 101,807 | 3.05 MB/s |
-| `--levels 12` added | 76,063 | 2.28 MB/s |
-| `--levels 8` added | 59,384 | 1.78 MB/s |
-| default density/tail, `--levels 12` | 58,813 | 1.76 MB/s |
+| `-d 0.75 --tail-max 40` (dense, long) | 48,878 | 1.47 MB/s |
+| `--levels 12` added | 36,403 | 1.09 MB/s |
+| `--levels 8` added | 29,041 | 0.87 MB/s |
+| default density/tail, `--levels 12` | 33,288 | 1.00 MB/s |
 
-Density and tail length matter as much as `--levels`: they set how many cells are
-lit at all, and dense-and-long roughly doubles it.
+Density and tail length set how many cells are lit, and dense-and-long roughly
+doubles that. It no longer doubles the output: a lit cell that holds its level
+costs nothing after it is first drawn, and most do.
 
 One measurement trap worth knowing if you benchmark this yourself: the slowest
 drops fall at 6 rows/sec, so a 175-row window needs ~29 *seconds* of simulated
@@ -226,14 +237,14 @@ changed — so the product barely moves. At 204×175:
 
 | `--fps` | bytes/frame | MB/s | if it were linear |
 |---|---|---|---|
-| 60 | 31,605 | 1.90 | — |
-| **30** (default) | 60,070 | **1.80** | 1.80 |
-| 24 | 72,835 | 1.75 | 1.44 |
-| 15 | 102,913 | **1.54** | 0.90 |
-| 10 | 130,480 | 1.30 | 0.60 |
+| 60 | 15,874 | 0.95 | — |
+| **30** (default) | 29,424 | **0.88** | 0.88 |
+| 24 | 35,444 | 0.85 | 0.71 |
+| 15 | 52,319 | **0.78** | 0.44 |
+| 10 | 67,497 | 0.67 | 0.29 |
 
-Dropping 30 → 15 fps buys **14%**, not 50%, and costs you half your frames. Going
-the other way is nearly free: 60 fps costs only 5% more than 30. Spend your
+Dropping 30 → 15 fps buys **11%**, not 50%, and costs you half your frames. Going
+the other way is nearly free: 60 fps costs only 8% more than 30. Spend your
 budget on `--levels`, `-d` and `--tail-max` instead.
 
 Measuring this also exposed a methodology bug worth repeating here: the harness
@@ -303,13 +314,19 @@ Kept here because they look obviously correct and aren't:
   keep the pipe fed after a write completes. Worth ~10% more displayed frames
   against a steadily throttled reader, but ~10% *fewer* against a hitching one,
   and it makes the sim step at 120 Hz for no visible benefit. A wash; dropped.
-- **Dropping glyph churn** (`-m 0`) saves only ~4%. Churn rewrites glyphs but
-  those cells are usually already being repainted for their colour.
+- **Dropping glyph churn** (`-m 0`) saves only ~8%. Churn rewrites glyphs, and
+  most lit cells hold their colour, so it is a larger share than it used to be,
+  but still a small one.
 
-Reusing the pen for imperceptible colour deltas *did* pay, but modestly — 6%.
+Reusing the pen for imperceptible colour deltas *did* pay, but modestly — 6%
+under the old fade. Most trails now hold one colour, so there are few near-misses
+left to reuse it for, and it is down to under 1%.
 
 Reproduce any of this with `cargo run --release --example perf`, which breaks
-output down by escape-sequence type and runs the comparisons above.
+output down by escape-sequence type and runs the comparisons above. The figures
+are for the current trail profile. Versions before 0.4 used a different one and
+drew a different animation from the same `--seed`, so their numbers don't
+compare directly.
 
 ## Fonts
 
